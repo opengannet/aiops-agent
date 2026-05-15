@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -130,6 +131,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 		return nil, err
 	}
 	go r.handleEvents(r.events)
+	r.registerSystemdServices()
+	go r.scanProcs()
 	if err = r.tracer.Run(r.events); err != nil {
 		close(r.events)
 		return nil, err
@@ -166,6 +169,13 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			for pid, c := range r.containersByPid {
 				cg, err := proc.ReadCgroup(pid)
 				if err != nil {
+					// Check if the process still exists before deleting
+					// On kernel 4.4, ReadCgroup can fail due to /proc race condition
+					procPath := fmt.Sprintf("/proc/%d", pid)
+					if fi, fiErr := os.Stat(procPath); fiErr == nil && fi.IsDir() {
+						// Process still exists, keep the container (TOCTOU race)
+						continue
+					}
 					delete(r.containersByPid, pid)
 					if c != nil {
 						c.onProcessExit(pid, false)
@@ -387,20 +397,16 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		r.containersByPidIgnored[pid] = &t
 		return nil
 	}
-	if cg.ContainerType == cgroup.ContainerTypeSystemdService && *flags.SkipSystemdSystemServices {
-		if md.systemd.IsSystemService() {
-			klog.InfoS("skipping system service", "id", id, "unit", md.systemd.Unit, "type", md.systemd.Type, "triggered_by", md.systemd.TriggeredBy, "pid", pid)
-			t := time.Now()
-			r.containersByPidIgnored[pid] = &t
-			return nil
-		}
-	}
+// System services are no longer skipped - collect logs from all systemd units
+// The previous skip logic removed to ensure all logs are captured
 
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
 		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
 			c.cgroup = cg
 			c.metadata = md
+			c.runLogParser("")
+		} else if c.cgroup.ContainerType == cgroup.ContainerTypeSystemdService && c.metadata.systemd.Unit != "" {
 			c.runLogParser("")
 		}
 		r.containersByPid[pid] = c
@@ -440,6 +446,10 @@ func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
 
 func (r *Registry) updateTrafficStats() {
 	iter := r.tracer.ActiveConnectionsIterator()
+	if iter == nil {
+		r.trafficStatsUpdateCh <- nil
+		return
+	}
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
 	for iter.Next(&cid, &stats) {
@@ -458,6 +468,10 @@ func (r *Registry) updateTrafficStats() {
 
 func (r *Registry) updateNodejsStats() {
 	iter := r.tracer.NodejsStatsIterator()
+	if iter == nil {
+		r.nodejsStatsUpdateCh <- nil
+		return
+	}
 	var pid uint64
 	stats := ebpftracer.NodejsStats{}
 
@@ -473,6 +487,10 @@ func (r *Registry) updateNodejsStats() {
 
 func (r *Registry) updatePythonStats() {
 	iter := r.tracer.PythonStatsIterator()
+	if iter == nil {
+		r.pythonStatsUpdateCh <- nil
+		return
+	}
 	var pid uint64
 	stats := ebpftracer.PythonStats{}
 
@@ -633,4 +651,118 @@ type JvmProfilingStats struct {
 type GoProfilingStats struct {
 	AllocBytes   int64
 	AllocObjects int64
+}
+
+// scanProcs periodically scans /proc to discover all running PIDs
+// This is needed when eBPF is not available (kernel < 4.4)
+const procScanInterval = 30 * time.Second
+
+func (r *Registry) scanProcs() {
+	ticker := time.NewTicker(procScanInterval)
+	defer ticker.Stop()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		klog.Warningln("failed to read /proc:", err)
+		return
+	}
+	r.scanProcsOnce(entries)
+	for range ticker.C {
+		entries, err = os.ReadDir("/proc")
+		if err != nil {
+			continue
+		}
+		r.scanProcsOnce(entries)
+	}
+}
+
+// registerSystemdServices enumerates systemd service directories under the cgroup filesystem
+// and registers them as containers, bypassing the /proc race condition on kernel 4.4
+func (r *Registry) registerSystemdServices() {
+	basePath := cgroup.BaseCgroupPath()
+	systemSlicePath := path.Join(basePath, "system.slice")
+	klog.Infof("registering systemd services from %s", systemSlicePath)
+	entries, err := os.ReadDir(systemSlicePath)
+	if err != nil {
+		klog.Warningf("failed to read system.slice directory %s: %v", systemSlicePath, err)
+		return
+	}
+	klog.Infof("found %d entries in system.slice", len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		unitName := e.Name()
+		if !strings.HasSuffix(unitName, ".service") {
+			continue
+		}
+		cgroupPath := path.Join(basePath, "system.slice", unitName)
+		cgId := cgroupPath
+		containerType := cgroup.ContainerTypeSystemdService
+		containerId := "/" + path.Base(cgroupPath)
+		// Build a synthetic Cgroup for this systemd service
+		cg := &cgroup.Cgroup{
+			Id:            cgId,
+			ContainerType: containerType,
+			ContainerId:  containerId,
+		}
+		// Get metadata for the systemd unit
+		md, err := getContainerMetadata(cg)
+		if err != nil {
+			klog.Warningf("failed to get metadata for systemd unit %s: %v", unitName, err)
+			continue
+		}
+		id := calcId(cg, md)
+		if id == "" {
+			klog.Warningf("empty container id for systemd unit %s", unitName)
+			continue
+		}
+		// Find the PID for this service
+		pid := findPidForUnit(unitName)
+	_, err = NewContainer(id, cg, md, pid, r)
+	if err != nil {
+			klog.Warningf("failed to create container for %s: %v", unitName, err)
+			continue
+		}
+		klog.Infof("registered systemd service %s as container %s (pid=%d)", unitName, id, pid)
+	}
+}
+
+// findPidForUnit finds the PID of a systemd unit by reading the cgroup tasks file
+func findPidForUnit(unitName string) uint32 {
+	basePath := cgroup.BaseCgroupPath()
+	tasksFile := path.Join(basePath, "system.slice", unitName, "tasks")
+	// Retry on transient errors (kernel 4.4 race condition)
+	var data []byte
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		data, err = os.ReadFile(tasksFile)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		pid, err := strconv.ParseUint(strings.TrimSpace(line), 10, 32)
+		if err == nil {
+			return uint32(pid)
+		}
+	}
+	return 0
+}
+
+func (r *Registry) scanProcsOnce(entries []os.DirEntry) {
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pidStr := e.Name()
+		pid, err := strconv.ParseUint(pidStr, 10, 32)
+		if err != nil {
+			continue
+		}
+		r.getOrCreateContainer(uint32(pid))
+	}
 }

@@ -17,7 +17,7 @@ var (
 	cgRoot  = *flags.CgroupRoot
 	cg2Root = *flags.CgroupRoot
 
-	baseCgroupPath = ""
+	baseCgroupPath = "/sys/fs/cgroup/systemd"
 
 	dockerIdRegexp      = regexp.MustCompile(`([a-z0-9]{64})`)
 	crioIdRegexp        = regexp.MustCompile(`crio-([a-z0-9]{64})`)
@@ -59,6 +59,10 @@ func (t ContainerType) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+func BaseCgroupPath() string {
+	return baseCgroupPath
 }
 
 type Cgroup struct {
@@ -154,7 +158,20 @@ func NewFromProcessCgroupFile(filePath string) (*Cgroup, error) {
 }
 
 func containerByCgroup(cgroupPath string) (ContainerType, string, error) {
-	parts := strings.Split(strings.TrimLeft(cgroupPath, "/"), "/")
+	// Strip baseCgroupPath prefix to get the actual cgroup path
+	relPath := cgroupPath
+	if strings.HasPrefix(cgroupPath, baseCgroupPath) {
+		relPath = strings.TrimPrefix(cgroupPath, baseCgroupPath)
+		if relPath == "" || relPath == "/" {
+			relPath = "/"
+		}
+		// Ensure leading slash for regex matching
+		if !strings.HasPrefix(relPath, "/") {
+			relPath = "/" + relPath
+		}
+	}
+
+	parts := strings.Split(strings.TrimLeft(relPath, "/"), "/")
 	if len(parts) == 0 {
 		return ContainerTypeStandaloneProcess, "", nil
 	}

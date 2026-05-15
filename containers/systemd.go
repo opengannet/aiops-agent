@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/coroot/coroot-node-agent/proc"
+	"k8s.io/klog/v2"
 
 	"github.com/coreos/go-systemd/v22/dbus"
 	gdbus "github.com/godbus/dbus/v5"
@@ -138,7 +139,9 @@ func getSystemdProperties(id string) (SystemdProperties, error) {
 	}
 	properties, err := dbusClient.GetAllPropertiesContext(ctx, props.Unit, true)
 	if err != nil {
-		return props, fmt.Errorf("failed to get systemd properties: %w", err)
+		// D-Bus failure is not fatal - Unit name is already extracted from cgroup path
+		klog.Warningf("D-Bus failed for unit %s: %v (using fallback)", props.Unit, err)
+		return props, nil
 	}
 	if v, ok := properties["TriggeredBy"]; ok {
 		if values, _ := v.([]string); len(values) > 0 {

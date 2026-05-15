@@ -150,7 +150,9 @@ func (t *Tracer) Close() {
 	}
 	t.globalUprobes = nil
 	t.globalUprobesLock.Unlock()
-	t.collection.Close()
+	if t.collection != nil {
+		t.collection.Close()
+	}
 }
 
 func (t *Tracer) AcquireGlobalUprobe(path string, attach func() []link.Link) (UprobeKey, bool) {
@@ -195,14 +197,23 @@ func (t *Tracer) ReleaseGlobalUprobes(keys ...UprobeKey) {
 }
 
 func (t *Tracer) ActiveConnectionsIterator() *ebpf.MapIterator {
+	if t.collection == nil {
+		return nil
+	}
 	return t.collection.Maps["active_connections"].Iterate()
 }
 
 func (t *Tracer) NodejsStatsIterator() *ebpf.MapIterator {
+	if t.collection == nil {
+		return nil
+	}
 	return t.collection.Maps["nodejs_stats"].Iterate()
 }
 
 func (t *Tracer) PythonStatsIterator() *ebpf.MapIterator {
+	if t.collection == nil {
+		return nil
+	}
 	return t.collection.Maps["python_stats"].Iterate()
 }
 
@@ -267,7 +278,8 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		break
 	}
 	if len(prog) == 0 {
-		return fmt.Errorf("unsupported kernel version: %s %s", kv, flags)
+		klog.Warningf("eBPF not supported on kernel %s %s - skipping eBPF", kv, flags)
+		return nil  // gracefully skip eBPF on unsupported kernels
 	}
 
 	reader, err := gzip.NewReader(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(prog)))

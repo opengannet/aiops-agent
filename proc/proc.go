@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/coroot/coroot-node-agent/cgroup"
 )
@@ -61,7 +62,27 @@ func GetNsPid(pid uint32) (uint32, error) {
 }
 
 func ReadCgroup(pid uint32) (*cgroup.Cgroup, error) {
-	return cgroup.NewFromProcessCgroupFile(Path(pid, "cgroup"))
+	filePath := Path(pid, "cgroup")
+	// Retry on transient errors (kernel 4.4 race condition)
+	for attempt := 0; attempt < 3; attempt++ {
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			if attempt < 2 {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return nil, err
+		}
+		cg, err := cgroup.NewFromProcessCgroupFile(filePath)
+		if err != nil {
+			if attempt < 2 {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return nil, err
+		}
+		return cg, nil
+	}
+	return nil, os.ErrNotExist
 }
 
 func ListPids() ([]uint32, error) {

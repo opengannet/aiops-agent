@@ -155,6 +155,29 @@ func (t *Tracer) init(ch chan<- Event) error {
 		}
 	}
 
+	// skip eBPF map writes when eBPF was not loaded (e.g. old kernel)
+	if t.collection == nil {
+		timestamp := uint64(time.Now().UnixNano())
+		for _, s := range socks {
+			typ := EventTypeConnectionOpen
+			if s.Listen {
+				typ = EventTypeListenOpen
+			} else if listens[uint64(s.pid)<<32|uint64(s.SAddr.Port())] || s.DAddr.Port() > s.SAddr.Port() {
+				continue
+			}
+			ch <- Event{
+				Type:          typ,
+				Pid:           s.pid,
+				Timestamp:     timestamp,
+				Fd:            s.fd,
+				SrcAddr:       s.SAddr,
+				DstAddr:       s.DAddr,
+				ActualDstAddr: s.actualDest,
+			}
+		}
+		return nil
+	}
+
 	ebpfConnectionsMap := t.collection.Maps["active_connections"]
 	timestamp := uint64(time.Now().UnixNano())
 	for _, s := range socks {

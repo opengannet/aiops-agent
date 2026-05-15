@@ -85,13 +85,16 @@ func (r *JournaldReader) follow() {
 			Content:   msg,
 			Level:     logparser.LevelByPriority(e.Fields[sdjournal.SD_JOURNAL_FIELD_PRIORITY]),
 		}
-		r.lock.Lock()
-		ch, ok := r.subscribers[e.Fields[sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT]]
-		r.lock.Unlock()
-		if !ok {
-			continue
-		}
-		ch <- le
+	r.lock.Lock()
+	ch, ok := r.subscribers[e.Fields[sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT]]
+	if !ok {
+		ch, ok = r.subscribers[""]
+	}
+	r.lock.Unlock()
+	if !ok {
+		continue
+	}
+	ch <- le
 	}
 }
 

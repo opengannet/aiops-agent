@@ -28,7 +28,9 @@ func JournaldSubscribe(unit string, ch chan<- logparser.LogEntry) error {
 	if journaldReader == nil {
 		return fmt.Errorf("journald reader not initialized")
 	}
-	err := journaldReader.Subscribe(unit, ch)
+	// Subscribe to ALL journald entries (no unit filter)
+	// This captures logs from all systemd services without needing D-Bus
+	err := journaldReader.Subscribe("", ch)
 	if err != nil {
 		return err
 	}

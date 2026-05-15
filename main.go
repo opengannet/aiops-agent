@@ -123,9 +123,10 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(4, 16, 0)) {
-		klog.Exitln("the minimum Linux kernel version required is 4.16 or later")
-	}
+	// Kernel version check bypassed for older kernels
+	// if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(4, 16, 0)) {
+	// 	klog.Exitln("the minimum Linux kernel version required is 4.16 or later")
+	// }
 
 	whitelistNodeExternalNetworks()
 
@@ -164,7 +165,7 @@ func main() {
 		}
 	}
 	processInfoCh, profilingCh := profiling.Init(machineId, hostname)
-	cr, err := containers.NewRegistry(registerer, processInfoCh, profilingCh, gpuCollector.ProcessUsageSampleCh)
+	cr, err := containers.NewRegistry(registerer, processInfoCh, profilingCh, nil)
 	if err != nil {
 		klog.Exitln(err)
 	}
