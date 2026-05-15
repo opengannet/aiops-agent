@@ -54,6 +54,7 @@ type Registry struct {
 	containersByCgroupId   map[string]*Container
 	containersByPid        map[uint32]*Container
 	containersByPidIgnored map[uint32]*time.Time
+	containersByPidLock    sync.RWMutex
 	ip2fqdn                map[netaddr.IP]*common.Domain
 	ip2fqdnLock            sync.RWMutex
 
@@ -220,70 +221,96 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				}
 			}
 			r.ip2fqdnLock.Unlock()
-		case u := <-r.trafficStatsUpdateCh:
-			if u == nil {
-				continue
+	case u := <-r.trafficStatsUpdateCh:
+		if u == nil {
+			continue
+		}
+		r.containersByPidLock.RLock()
+		c := r.containersByPid[u.Pid]
+		r.containersByPidLock.RUnlock()
+		if c != nil {
+			c.updateTrafficStats(u)
+		}
+	case u := <-r.nodejsStatsUpdateCh:
+		if u == nil {
+			continue
+		}
+		r.containersByPidLock.RLock()
+		c := r.containersByPid[u.Pid]
+		r.containersByPidLock.RUnlock()
+		if c != nil {
+			c.updateNodejsStats(*u)
+		}
+	case u := <-r.pythonStatsUpdateCh:
+		if u == nil {
+			continue
+		}
+		r.containersByPidLock.RLock()
+		c := r.containersByPid[u.Pid]
+		r.containersByPidLock.RUnlock()
+		if c != nil {
+			c.updatePythonStats(*u)
+		}
+	case u := <-r.profilingUpdateCh:
+		r.containersByPidLock.RLock()
+		c := r.containersByPid[u.Pid]
+		r.containersByPidLock.RUnlock()
+		if c != nil {
+			switch u.Runtime {
+			case RuntimeJvm:
+				c.updateJvmProfilingStats(u)
+			case RuntimeGo:
+				c.updateGoProfilingStats(u)
 			}
-			if c := r.containersByPid[u.Pid]; c != nil {
-				c.updateTrafficStats(u)
+		}
+	case sample := <-r.gpuProcessUsageSampleChan:
+		r.containersByPidLock.RLock()
+		c := r.containersByPid[sample.Pid]
+		r.containersByPidLock.RUnlock()
+		if c != nil {
+			if p := c.processes[sample.Pid]; p != nil {
+				p.addGpuUsageSample(sample)
 			}
-		case u := <-r.nodejsStatsUpdateCh:
-			if u == nil {
-				continue
-			}
-			if c := r.containersByPid[u.Pid]; c != nil {
-				c.updateNodejsStats(*u)
-			}
-		case u := <-r.pythonStatsUpdateCh:
-			if u == nil {
-				continue
-			}
-			if c := r.containersByPid[u.Pid]; c != nil {
-				c.updatePythonStats(*u)
-			}
-		case u := <-r.profilingUpdateCh:
-			if c := r.containersByPid[u.Pid]; c != nil {
-				switch u.Runtime {
-				case RuntimeJvm:
-					c.updateJvmProfilingStats(u)
-				case RuntimeGo:
-					c.updateGoProfilingStats(u)
-				}
-			}
-		case sample := <-r.gpuProcessUsageSampleChan:
-			if c := r.containersByPid[sample.Pid]; c != nil {
-				if p := c.processes[sample.Pid]; p != nil {
-					p.addGpuUsageSample(sample)
-				}
-			}
+		}
 		case e, more := <-ch:
 			if !more {
 				return
 			}
 			switch e.Type {
-			case ebpftracer.EventTypeProcessStart:
-				c, seen := r.containersByPid[e.Pid]
-				switch { // possible pids wraparound + missed `process-exit` event
-				case c == nil && seen: // ignored
-					delete(r.containersByPid, e.Pid)
-				case c != nil: // revalidating by cgroup
-					cg, err := proc.ReadCgroup(e.Pid)
-					if err != nil || cg.Id != c.cgroup.Id {
-						delete(r.containersByPid, e.Pid)
-						c.onProcessExit(e.Pid, false)
-					}
-				}
+	case ebpftracer.EventTypeProcessStart:
+		r.containersByPidLock.RLock()
+		c, seen := r.containersByPid[e.Pid]
+		r.containersByPidLock.RUnlock()
+		switch { // possible pids wraparound + missed `process-exit` event
+		case c == nil && seen: // ignored
+			r.containersByPidLock.Lock()
+			delete(r.containersByPid, e.Pid)
+			r.containersByPidLock.Unlock()
+		case c != nil: // revalidating by cgroup
+			cg, err := proc.ReadCgroup(e.Pid)
+			if err != nil || cg.Id != c.cgroup.Id {
+				r.containersByPidLock.Lock()
+				delete(r.containersByPid, e.Pid)
+				r.containersByPidLock.Unlock()
+				c.onProcessExit(e.Pid, false)
+			}
+		}
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					p := c.onProcessStart(e.Pid)
 					if r.processInfoCh != nil && p != nil {
 						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
 					}
 				}
-			case ebpftracer.EventTypeProcessExit:
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill)
-				}
-				delete(r.containersByPid, e.Pid)
+	case ebpftracer.EventTypeProcessExit:
+		r.containersByPidLock.RLock()
+		c := r.containersByPid[e.Pid]
+		r.containersByPidLock.RUnlock()
+		if c != nil {
+			c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill)
+		}
+		r.containersByPidLock.Lock()
+		delete(r.containersByPid, e.Pid)
+		r.containersByPidLock.Unlock()
 
 			case ebpftracer.EventTypeFileOpen:
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
@@ -310,22 +337,28 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 				if c := r.getOrCreateContainer(e.Pid); c != nil {
 					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
 				}
-			case ebpftracer.EventTypeConnectionClose:
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.onConnectionClose(e)
-				}
+	case ebpftracer.EventTypeConnectionClose:
+		r.containersByPidLock.RLock()
+		c := r.containersByPid[e.Pid]
+		r.containersByPidLock.RUnlock()
+		if c != nil {
+			c.onConnectionClose(e)
+		}
 			case ebpftracer.EventTypeTCPRetransmit:
 				for _, c := range r.containersById {
 					if c.onRetransmission(e.SrcAddr, e.DstAddr) {
 						break
 					}
 				}
-			case ebpftracer.EventTypeL7Request:
-				if e.L7Request == nil {
-					continue
-				}
-				if c := r.containersByPid[e.Pid]; c != nil {
-					ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request)
+	case ebpftracer.EventTypeL7Request:
+		if e.L7Request == nil {
+			continue
+		}
+		r.containersByPidLock.RLock()
+		c := r.containersByPid[e.Pid]
+		r.containersByPidLock.RUnlock()
+		if c != nil {
+			ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request)
 					r.ip2fqdnLock.Lock()
 					for ip, domain := range ip2fqdn {
 						r.ip2fqdn[ip] = domain
@@ -336,16 +369,23 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 		}
 	}
 }
-
 func (r *Registry) getOrCreateContainer(pid uint32) *Container {
-	if c := r.containersByPid[pid]; c != nil {
+	r.containersByPidLock.RLock()
+	c := r.containersByPid[pid]
+	r.containersByPidLock.RUnlock()
+	if c != nil {
 		return c
 	} else {
-		if t := r.containersByPidIgnored[pid]; t != nil {
+		r.containersByPidLock.RLock()
+		t := r.containersByPidIgnored[pid]
+		r.containersByPidLock.RUnlock()
+		if t != nil {
 			if time.Since(*t) < IgnoredContainersCacheTTL {
 				return nil
 			} else {
+				r.containersByPidLock.Lock()
 				delete(r.containersByPidIgnored, pid)
+				r.containersByPidLock.Unlock()
 			}
 		}
 	}
@@ -360,7 +400,9 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		return nil
 	}
 	if c := r.containersByCgroupId[cg.Id]; c != nil {
+		r.containersByPidLock.Lock()
 		r.containersByPid[pid] = c
+		r.containersByPidLock.Unlock()
 		return c
 	}
 	if cg.ContainerType == cgroup.ContainerTypeSandbox {
@@ -383,18 +425,22 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	klog.Infof("calculated container id %d -> %s -> %s", pid, cg.Id, id)
 	if id == "" {
 		if cg.Id == "/init.scope" && pid != 1 {
-			klog.InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
-		} else {
-			klog.InfoS("ignoring", "cg", cg.Id, "pid", pid)
-			t := time.Now()
-			r.containersByPidIgnored[pid] = &t
-		}
+		klog.InfoS("ignoring without persisting", "cg", cg.Id, "pid", pid)
+	} else {
+		klog.InfoS("ignoring", "cg", cg.Id, "pid", pid)
+		t := time.Now()
+		r.containersByPidLock.Lock()
+		r.containersByPidIgnored[pid] = &t
+		r.containersByPidLock.Unlock()
+	}
 		return nil
 	}
 	if common.ContainerFilter.ShouldBeSkipped(string(id)) {
 		klog.InfoS("skipping due to user-defined settings", "id", id, "pid", pid)
 		t := time.Now()
+		r.containersByPidLock.Lock()
 		r.containersByPidIgnored[pid] = &t
+		r.containersByPidLock.Unlock()
 		return nil
 	}
 // System services are no longer skipped - collect logs from all systemd units
@@ -409,21 +455,24 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 		} else if c.cgroup.ContainerType == cgroup.ContainerTypeSystemdService && c.metadata.systemd.Unit != "" {
 			c.runLogParser("")
 		}
+		r.containersByPidLock.Lock()
 		r.containersByPid[pid] = c
+		r.containersByPidLock.Unlock()
 		r.containersByCgroupId[cg.Id] = c
 		return c
 	}
-	c, err := NewContainer(id, cg, md, pid, r)
+	c, err = NewContainer(id, cg, md, pid, r)
 	if err != nil {
 		klog.Warningf("failed to create container pid=%d cg=%s id=%s: %s", pid, cg.Id, id, err)
 		return nil
 	}
 	klog.InfoS("detected a new container", "pid", pid, "cg", cg.Id, "id", id, "app", c.appId)
 	if err := prometheus.WrapRegistererWith(prometheus.Labels{"container_id": string(id), "app_id": c.appId}, r.reg).Register(c); err != nil {
-		klog.Warningln("failed to register container:", err)
 		return nil
 	}
+	r.containersByPidLock.Lock()
 	r.containersByPid[pid] = c
+	r.containersByPidLock.Unlock()
 	r.containersByCgroupId[cg.Id] = c
 	r.containersById[id] = c
 	return c
