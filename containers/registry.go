@@ -134,7 +134,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 	go r.handleEvents(r.events)
 	if err = r.tracer.Run(r.events); err != nil {
 		close(r.events)
-		return nil, err
+		r.events = nil
+		klog.Warningf("eBPF tracer is unavailable, continuing without eBPF: %s", err)
 	}
 
 	return r, nil
@@ -156,7 +157,9 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 
 func (r *Registry) Close() {
 	r.tracer.Close()
-	close(r.events)
+	if r.events != nil {
+		close(r.events)
+	}
 }
 
 func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
@@ -251,7 +254,8 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 		case e, more := <-ch:
 			if !more {
-				return
+				ch = nil
+				continue
 			}
 			switch e.Type {
 			case ebpftracer.EventTypeProcessStart:
@@ -434,6 +438,10 @@ func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
 	if time.Now().Sub(r.ebpfStatsLastUpdated) < MinTrafficStatsUpdateInterval {
 		return
 	}
+	if !r.tracer.Loaded() {
+		r.ebpfStatsLastUpdated = time.Now()
+		return
+	}
 
 	r.updateTrafficStats()
 	r.updateNodejsStats()
@@ -443,7 +451,13 @@ func (r *Registry) updateStatsFromEbpfMapsIfNecessary() {
 }
 
 func (r *Registry) gcActiveConnections() {
+	if !r.tracer.Loaded() {
+		return
+	}
 	iter := r.tracer.ActiveConnectionsIterator()
+	if iter == nil {
+		return
+	}
 	cid := ebpftracer.ConnectionId{}
 	conn := ebpftracer.Connection{}
 	var stale []ebpftracer.ConnectionId
@@ -464,6 +478,9 @@ func (r *Registry) gcActiveConnections() {
 
 func (r *Registry) updateTrafficStats() {
 	iter := r.tracer.ActiveConnectionsIterator()
+	if iter == nil {
+		return
+	}
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
 	for iter.Next(&cid, &stats) {
@@ -482,6 +499,9 @@ func (r *Registry) updateTrafficStats() {
 
 func (r *Registry) updateNodejsStats() {
 	iter := r.tracer.NodejsStatsIterator()
+	if iter == nil {
+		return
+	}
 	var pid uint64
 	stats := ebpftracer.NodejsStats{}
 
@@ -497,6 +517,9 @@ func (r *Registry) updateNodejsStats() {
 
 func (r *Registry) updatePythonStats() {
 	iter := r.tracer.PythonStatsIterator()
+	if iter == nil {
+		return
+	}
 	var pid uint64
 	stats := ebpftracer.PythonStats{}
 

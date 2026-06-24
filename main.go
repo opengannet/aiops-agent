@@ -123,10 +123,6 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	if !common.GetKernelVersion().GreaterOrEqual(common.NewVersion(4, 16, 0)) {
-		klog.Exitln("the minimum Linux kernel version required is 4.16 or later")
-	}
-
 	whitelistNodeExternalNetworks()
 
 	machineId := machineID()

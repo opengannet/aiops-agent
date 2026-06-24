@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/coroot/coroot-node-agent/common"
 
 	"github.com/containerd/cgroups"
@@ -29,6 +31,72 @@ func skipIfNotVM(t *testing.T) {
 	if os.Getenv("VM") == "" {
 		t.SkipNow()
 	}
+}
+
+func TestShouldDisableL7TracingForOldKernels(t *testing.T) {
+	assert.True(t, shouldDisableL7Tracing(common.NewVersion(4, 19, 82), false))
+	assert.True(t, shouldDisableL7Tracing(common.NewVersion(5, 15, 0), true))
+	assert.False(t, shouldDisableL7Tracing(common.NewVersion(5, 15, 0), false))
+}
+
+func TestStripL7TracingRemovesProgramsAndMapsBeforeLoad(t *testing.T) {
+	spec := &ebpf.CollectionSpec{
+		Programs: map[string]*ebpf.ProgramSpec{
+			"sys_enter_writev":                {Name: "sys_enter_writev"},
+			"openssl_SSL_write_enter":         {Name: "openssl_SSL_write_enter"},
+			"go_crypto_tls_read_exit":         {Name: "go_crypto_tls_read_exit"},
+			"rustls_read_enter":               {Name: "rustls_read_enter"},
+			"java_tls_write_enter":            {Name: "java_tls_write_enter"},
+			"tracepoint__sched_process_exit":  {Name: "tracepoint__sched_process_exit"},
+			"tracepoint__inet_sock_set_state": {Name: "tracepoint__inet_sock_set_state"},
+		},
+		Maps: map[string]*ebpf.MapSpec{
+			"l7_events":          {Name: "l7_events"},
+			"l7_event_heap":      {Name: "l7_event_heap"},
+			"active_reads":       {Name: "active_reads"},
+			"active_l7_requests": {Name: "active_l7_requests"},
+			"ssl_pending":        {Name: "ssl_pending"},
+			"proc_events":        {Name: "proc_events"},
+			"active_connections": {Name: "active_connections"},
+		},
+	}
+
+	stripL7Tracing(spec)
+
+	for _, name := range []string{
+		"sys_enter_writev",
+		"openssl_SSL_write_enter",
+		"go_crypto_tls_read_exit",
+		"rustls_read_enter",
+		"java_tls_write_enter",
+	} {
+		assert.NotContains(t, spec.Programs, name)
+	}
+	for _, name := range []string{"l7_events", "l7_event_heap", "active_reads", "ssl_pending"} {
+		assert.NotContains(t, spec.Maps, name)
+	}
+
+	assert.Contains(t, spec.Programs, "tracepoint__sched_process_exit")
+	assert.Contains(t, spec.Programs, "tracepoint__inet_sock_set_state")
+	assert.Contains(t, spec.Maps, "proc_events")
+	assert.Contains(t, spec.Maps, "active_connections")
+	assert.Contains(t, spec.Maps, "active_l7_requests")
+}
+
+func TestTracerUnavailableMethodsAreSafe(t *testing.T) {
+	tracer := NewTracer(0, 0, false)
+
+	require.False(t, tracer.Loaded())
+	require.NotPanics(t, tracer.Close)
+	assert.Nil(t, tracer.ActiveConnectionsIterator())
+	assert.NoError(t, tracer.DeleteActiveConnection(ConnectionId{}))
+	assert.Nil(t, tracer.NodejsStatsIterator())
+	assert.Nil(t, tracer.PythonStatsIterator())
+	_, ok := tracer.AcquireGlobalUprobe("/does-not-matter", func() []link.Link {
+		t.Fatal("attach callback must not run without a loaded collection")
+		return nil
+	})
+	assert.False(t, ok)
 }
 
 func TestProcessEvents(t *testing.T) {

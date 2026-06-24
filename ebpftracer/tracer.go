@@ -91,6 +91,59 @@ type globalUprobe struct {
 	refcount int
 }
 
+var l7ProgramNames = map[string]struct{}{
+	"sys_enter_write":           {},
+	"sys_enter_writev":          {},
+	"sys_enter_sendmsg":         {},
+	"sys_enter_sendmmsg":        {},
+	"sys_enter_sendto":          {},
+	"sys_enter_read":            {},
+	"sys_enter_readv":           {},
+	"sys_enter_recvmsg":         {},
+	"sys_enter_recvfrom":        {},
+	"sys_exit_read":             {},
+	"sys_exit_readv":            {},
+	"sys_exit_recvmsg":          {},
+	"sys_exit_recvfrom":         {},
+	"openssl_SSL_write_enter":   {},
+	"openssl_SSL_read_enter":    {},
+	"openssl_SSL_read_ex_enter": {},
+	"openssl_SSL_read_exit":     {},
+	"go_crypto_tls_write_enter": {},
+	"go_crypto_tls_read_enter":  {},
+	"go_crypto_tls_read_exit":   {},
+	"rustls_write_enter":        {},
+	"rustls_read_enter":         {},
+	"rustls_read_exit":          {},
+	"java_tls_write_enter":      {},
+	"java_tls_read_exit":        {},
+}
+
+var l7MapNames = map[string]struct{}{
+	"l7_event_heap":         {},
+	"l7_events":             {},
+	"active_reads":          {},
+	"ssl_pending":           {},
+	"rustls_last_read_fd":   {},
+	"java_tls_last_read_fd": {},
+	"rustls_write_pending":  {},
+	"l7_request_heap":       {},
+	"iovec_buf_heap":        {},
+}
+
+func shouldDisableL7Tracing(kv common.Version, explicitlyDisabled bool) bool {
+	return explicitlyDisabled || kv.Major == 4
+}
+
+func stripL7Tracing(spec *ebpf.CollectionSpec) {
+	for name := range l7ProgramNames {
+		delete(spec.Programs, name)
+	}
+	for name := range l7MapNames {
+		delete(spec.Maps, name)
+	}
+}
+
 type Tracer struct {
 	disableL7Tracing bool
 	hostNetNs        netns.NsHandle
@@ -138,6 +191,9 @@ func (t *Tracer) Run(events chan<- Event) error {
 }
 
 func (t *Tracer) Close() {
+	if t == nil {
+		return
+	}
 	for _, p := range t.uprobes {
 		_ = p.Close()
 	}
@@ -155,10 +211,21 @@ func (t *Tracer) Close() {
 	}
 	t.globalUprobes = nil
 	t.globalUprobesLock.Unlock()
-	t.collection.Close()
+	if t.collection != nil {
+		t.collection.Close()
+		t.collection = nil
+	}
+	t.collectionSpec = nil
+}
+
+func (t *Tracer) Loaded() bool {
+	return t != nil && t.collection != nil
 }
 
 func (t *Tracer) AcquireGlobalUprobe(path string, attach func() []link.Link) (UprobeKey, bool) {
+	if !t.Loaded() {
+		return UprobeKey{}, false
+	}
 	var stat syscall.Stat_t
 	if err := syscall.Stat(path, &stat); err != nil {
 		return UprobeKey{}, false
@@ -200,18 +267,30 @@ func (t *Tracer) ReleaseGlobalUprobes(keys ...UprobeKey) {
 }
 
 func (t *Tracer) ActiveConnectionsIterator() *ebpf.MapIterator {
+	if !t.Loaded() || t.collection.Maps["active_connections"] == nil {
+		return nil
+	}
 	return t.collection.Maps["active_connections"].Iterate()
 }
 
 func (t *Tracer) DeleteActiveConnection(cid ConnectionId) error {
+	if !t.Loaded() || t.collection.Maps["active_connections"] == nil {
+		return nil
+	}
 	return t.collection.Maps["active_connections"].Delete(&cid)
 }
 
 func (t *Tracer) NodejsStatsIterator() *ebpf.MapIterator {
+	if !t.Loaded() || t.collection.Maps["nodejs_stats"] == nil {
+		return nil
+	}
 	return t.collection.Maps["nodejs_stats"].Iterate()
 }
 
 func (t *Tracer) PythonStatsIterator() *ebpf.MapIterator {
+	if !t.Loaded() || t.collection.Maps["python_stats"] == nil {
+		return nil
+	}
 	return t.collection.Maps["python_stats"].Iterate()
 }
 
@@ -293,18 +372,34 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 	if err != nil {
 		return fmt.Errorf("failed to load collection spec: %w", err)
 	}
-	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
-	c, err := ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
-		//Programs: ebpf.ProgramOptions{LogLevel: 2, LogSize: 20 * 1024 * 1024},
-	})
-	if err != nil {
-		var vErr *ebpf.VerifierError
-		if errors.As(err, &vErr) {
-			klog.Errorf("%+v", vErr)
+	if shouldDisableL7Tracing(kv, t.disableL7Tracing) {
+		if !t.disableL7Tracing {
+			klog.Infof("L7 tracing is disabled on kernel %s", kv)
 		}
-		return fmt.Errorf("failed to load collection: %w", err)
+		t.disableL7Tracing = true
+		stripL7Tracing(collectionSpec)
+	}
+	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
+	c, err := newCollection(collectionSpec)
+	if err != nil {
+		if !t.disableL7Tracing {
+			logVerifierError(err)
+			klog.Warningf("failed to load eBPF collection with L7 tracing, retrying without L7 tracing: %s", err)
+			t.disableL7Tracing = true
+			stripL7Tracing(collectionSpec)
+			c, err = newCollection(collectionSpec)
+		}
+		if err != nil {
+			logVerifierError(err)
+			return fmt.Errorf("failed to load collection: %w", err)
+		}
 	}
 	t.collection = c
+	if t.disableL7Tracing {
+		klog.Infoln("eBPF tracer loaded with L7 tracing disabled")
+	} else {
+		klog.Infoln("eBPF tracer loaded with L7 tracing enabled")
+	}
 
 	perfMaps := []perfMap{
 		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4},
@@ -331,6 +426,19 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 
 	t.collectionSpec = collectionSpec
 	return nil
+}
+
+func newCollection(collectionSpec *ebpf.CollectionSpec) (*ebpf.Collection, error) {
+	return ebpf.NewCollectionWithOptions(collectionSpec, ebpf.CollectionOptions{
+		//Programs: ebpf.ProgramOptions{LogLevel: 2, LogSize: 20 * 1024 * 1024},
+	})
+}
+
+func logVerifierError(err error) {
+	var vErr *ebpf.VerifierError
+	if errors.As(err, &vErr) {
+		klog.Errorf("%+v", vErr)
+	}
 }
 
 func (t *Tracer) attachPrograms() error {
