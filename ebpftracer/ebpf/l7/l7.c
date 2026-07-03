@@ -616,7 +616,7 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
     } else if (e->protocol == PROTOCOL_KAFKA) {
         response = is_kafka_response(payload, req->request_id);
     } else if (e->protocol == PROTOCOL_CLICKHOUSE) {
-        response = is_clickhouse_response(payload, &e->status);
+        response = is_clickhouse_response(payload, ret, &e->status);
         if (!response) {
             return 0; // keeping the query in the map
         }
