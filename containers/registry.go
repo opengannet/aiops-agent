@@ -28,6 +28,7 @@ import (
 const (
 	MinTrafficStatsUpdateInterval = 5 * time.Second
 	IgnoredContainersCacheTTL     = 15 * time.Second
+	FallbackProcessScanInterval   = 30 * time.Second
 )
 
 var (
@@ -51,6 +52,9 @@ type Registry struct {
 
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
+
+	fallbackScannerStop chan struct{}
+	fallbackScannerDone chan struct{}
 
 	containersById         map[ContainerID]*Container
 	containersByCgroupId   map[string]*Container
@@ -134,9 +138,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 	}
 	go r.handleEvents(r.events)
 	if err = r.tracer.Run(r.events); err != nil {
-		close(r.events)
-		r.events = nil
 		klog.Warningf("eBPF tracer is unavailable, continuing without eBPF: %s", err)
+		r.startFallbackProcessScanner()
 	}
 
 	return r, nil
@@ -157,10 +160,90 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (r *Registry) Close() {
+	if r.fallbackScannerStop != nil {
+		close(r.fallbackScannerStop)
+		<-r.fallbackScannerDone
+	}
 	r.tracer.Close()
 	if r.events != nil {
 		close(r.events)
 	}
+}
+
+func newProcessPids(previous map[uint32]struct{}, current []uint32) ([]uint32, map[uint32]struct{}) {
+	seen := make(map[uint32]struct{}, len(current))
+	newPids := make([]uint32, 0, len(current))
+	for _, pid := range current {
+		seen[pid] = struct{}{}
+		if _, ok := previous[pid]; !ok {
+			newPids = append(newPids, pid)
+		}
+	}
+	return newPids, seen
+}
+
+func processSnapshotEvents(pid uint32, fds []proc.Fd) []ebpftracer.Event {
+	events := []ebpftracer.Event{{Type: ebpftracer.EventTypeProcessStart, Pid: pid}}
+	for _, fd := range fds {
+		if strings.HasPrefix(fd.Dest, "/") {
+			events = append(events, ebpftracer.Event{
+				Type: ebpftracer.EventTypeFileOpen,
+				Pid:  pid,
+				Fd:   fd.Fd,
+				Log:  strings.HasPrefix(fd.Dest, "/var/log/"),
+			})
+		}
+	}
+	return events
+}
+
+func (r *Registry) startFallbackProcessScanner() {
+	r.fallbackScannerStop = make(chan struct{})
+	r.fallbackScannerDone = make(chan struct{})
+	go func() {
+		defer close(r.fallbackScannerDone)
+		ticker := time.NewTicker(FallbackProcessScanInterval)
+		defer ticker.Stop()
+
+		seen := map[uint32]struct{}{}
+		scan := func() bool {
+			pids, err := proc.ListPids()
+			if err != nil {
+				klog.Warningf("failed to scan processes without eBPF: %s", err)
+				return true
+			}
+			var newPids []uint32
+			newPids, seen = newProcessPids(seen, pids)
+			for _, pid := range newPids {
+				fds, err := proc.ReadFds(pid)
+				if err != nil {
+					klog.V(4).Infof("failed to read file descriptors for pid %d without eBPF: %s", pid, err)
+				}
+				for _, event := range processSnapshotEvents(pid, fds) {
+					select {
+					case r.events <- event:
+					case <-r.fallbackScannerStop:
+						return false
+					}
+				}
+			}
+			return true
+		}
+
+		if !scan() {
+			return
+		}
+		for {
+			select {
+			case <-ticker.C:
+				if !scan() {
+					return
+				}
+			case <-r.fallbackScannerStop:
+				return
+			}
+		}
+	}()
 }
 
 func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
