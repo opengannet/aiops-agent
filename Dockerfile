@@ -1,4 +1,4 @@
-FROM debian:bullseye AS builder
+FROM docker.fzyun.io/library/debian:bullseye AS builder
 # Using Debian instead of the official Golang image because it’s based on newer OS versions
 # with newer glibc, which causes compatibility issues.
 
